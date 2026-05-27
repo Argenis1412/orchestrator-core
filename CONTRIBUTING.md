@@ -7,8 +7,8 @@ Thank you for your interest in contributing to Agent Lab! This document outlines
 1. **Fork the repository** on GitHub
 2. **Clone your fork locally**:
    ```bash
-   git clone https://github.com/your-username/agents.git
-   cd agents
+   git clone https://github.com/your-username/orchestrator-core.git
+   cd orchestrator-core
    ```
 
 3. **Set up development environment**:

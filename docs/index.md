@@ -53,8 +53,8 @@ Design and architecture decisions are documented in the Architecture Decision Re
 ### Installation
 
 ```bash
-git clone https://github.com/Argenis1412/agents.git
-cd agents
+git clone https://github.com/Argenis1412/orchestrator-core.git
+cd orchestrator-core
 pip install -e .
 ```
 
@@ -79,8 +79,8 @@ agent-lab run /path/to/project
 
 ```bash
 # Clone and navigate
-git clone https://github.com/Argenis1412/agents.git
-cd agents
+git clone https://github.com/Argenis1412/orchestrator-core.git
+cd orchestrator-core
 
 # Create virtual environment
 python -m venv .venv
