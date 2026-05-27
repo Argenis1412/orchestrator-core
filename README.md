@@ -15,12 +15,12 @@ flowchart LR
 
 ```bash
 # Clone and install
-git clone https://github.com/Argenis1412/agents.git
-cd agents
+git clone https://github.com/Argenis1412/orchestrator-core.git
+cd orchestrator-core
 pip install -e .
 
 # Run the scout pipeline
-agents run scout ./your-project
+orchestrator run scout ./your-project
 ```
 
 ### Execution Output
