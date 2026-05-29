@@ -12,6 +12,7 @@ from orchestrator.schemas.architect_output import ArchitectOutput
 from orchestrator.schemas.config import TargetConfig
 from orchestrator.schemas.pipeline_run import AgentMeta, PipelineRun, TaskResult
 from orchestrator.schemas.scout_output import ScoutOutput
+from orchestrator.workspace import WorkspaceManager
 
 
 class PipelineAbort(RuntimeError):
@@ -24,10 +25,8 @@ class Pipeline:
         self.run = PipelineRun(target_path=str(self.target_path))
         self.from_stage = from_stage
         
-        # Ensure directories exist
-        self.config.workspace_path.mkdir(parents=True, exist_ok=True)
-        (self.config.workspace_path / "logs").mkdir(exist_ok=True)
-        (self.config.workspace_path / "runs").mkdir(exist_ok=True)
+        self.workspace = WorkspaceManager(self.config.workspace_path)
+        self.workspace.setup()
 
     def execute(self, dry_run: bool = False) -> PipelineRun:
         _log("pipeline.start", run_id=self.run.run_id, target=str(self.target_path))
@@ -88,15 +87,18 @@ class Pipeline:
         return self.run
 
     def _load_stage_output(self, model_class, stage: str):
-        # Look for most recent log file for this stage
-        logs_dir = self.config.workspace_path / "logs"
-        files = sorted(logs_dir.glob(f"{stage}_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+        outputs_dir = self.workspace.outputs
+        files = sorted(outputs_dir.glob(f"{stage}_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
         if not files:
-            raise PipelineAbort(f"No previous output found for stage {stage} in {logs_dir}")
+            raise PipelineAbort(f"No previous output found for stage {stage} in {outputs_dir}")
         try:
             return model_class.model_validate_json(files[0].read_text())
         except Exception as e:
             raise PipelineAbort(f"Failed to load {stage} output: {e}. Re-run from an earlier stage.")
+
+    def _persist_stage_output(self, stage: str, output) -> None:
+        path = self.workspace.outputs / f"{stage}_{self.run.run_id}.json"
+        path.write_text(output.model_dump_json(indent=2), encoding="utf-8")
 
     def _stage_scout(self) -> ScoutOutput:
         _log("scout.start", run_id=self.run.run_id)
@@ -104,6 +106,7 @@ class Pipeline:
         try:
             output, meta = run_scout(self.config)
             self.run.scout_meta = AgentMeta(status="success", latency_ms=_ms(t0), **meta)
+            self._persist_stage_output("scout", output)
             _log("scout.done", cost=meta.get("cost_usd"))
             return output
         except Exception as exc:
@@ -116,6 +119,7 @@ class Pipeline:
         try:
             output, meta = run_architect(scout_output, config=self.config)
             self.run.architect_meta = AgentMeta(status="success", latency_ms=_ms(t0), **meta)
+            self._persist_stage_output("architect", output)
             if output.blockers:
                 raise PipelineAbort(f"architect raised blockers: {output.blockers}")
             return output
@@ -131,6 +135,7 @@ class Pipeline:
         try:
             result, meta = run_executor(architect_output, config=self.config)
             self.run.executor_meta = AgentMeta(status="success", latency_ms=_ms(t0), **meta)
+            self._persist_stage_output("executor", result)
             self.run.tasks_total = len(architect_output.implementation_plan)
             # Map executor results to run results
             for change in result.applied:
@@ -157,6 +162,7 @@ class Pipeline:
         try:
             result, meta = run_validator(config=self.config)
             self.run.validator_meta = AgentMeta(status="success" if result.overall_passed else "failed", latency_ms=_ms(t0), **meta)
+            self._persist_stage_output("validator", result)
         except Exception as exc:
             self.run.validator_meta = AgentMeta(status="failed", error=str(exc), latency_ms=_ms(t0))
             _log("validator.error", error=str(exc))
@@ -169,7 +175,7 @@ class Pipeline:
         return "completed"
 
     def _persist(self) -> None:
-        path = self.config.workspace_path / "runs" / f"pipeline_{self.run.run_id}.json"
+        path = self.workspace.runs / f"pipeline_{self.run.run_id}.json"
         path.write_text(self.run.model_dump_json(indent=2))
 
 def _ms(t0: float) -> int: return int((time.monotonic() - t0) * 1000)
