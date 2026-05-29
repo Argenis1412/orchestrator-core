@@ -146,15 +146,20 @@ def test_resume_from_architect_output(config, monkeypatch):
     mock_architect.assert_not_called()
 
 
-def test_resume_from_executor(config, monkeypatch):
+def test_resume_from_executor_reloads_task_count(config, monkeypatch):
     pipeline = Pipeline(config=config)
     path = pipeline.workspace.outputs / f"executor_{pipeline.run.run_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(_executor_output().model_dump_json())
+    path.write_text(_executor_output(applied=2).model_dump_json())
 
+    mock_validator = MagicMock(return_value=(_validator_output(passed=True), _meta()))
     monkeypatch.setattr("orchestrator.pipeline.run_scout", MagicMock())
     monkeypatch.setattr("orchestrator.pipeline.run_architect", MagicMock())
     monkeypatch.setattr("orchestrator.pipeline.run_executor", MagicMock())
+    monkeypatch.setattr("orchestrator.pipeline.run_validator", mock_validator)
 
     result = Pipeline(config=config, from_stage="executor").execute(dry_run=False)
     assert result.status == "completed"
+    assert result.tasks_applied == 2
+    assert result.validator_meta is not None
+    assert result.validator_meta.status == "success"

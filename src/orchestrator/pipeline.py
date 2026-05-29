@@ -10,6 +10,7 @@ from orchestrator.agents.scout import run as run_scout
 from orchestrator.agents.validator import run as run_validator
 from orchestrator.schemas.architect_output import ArchitectOutput
 from orchestrator.schemas.config import TargetConfig
+from orchestrator.schemas.executor_output import ExecutorOutput
 from orchestrator.schemas.pipeline_run import AgentMeta, PipelineRun, TaskResult
 from orchestrator.schemas.scout_output import ScoutOutput
 from orchestrator.workspace import WorkspaceManager
@@ -60,9 +61,8 @@ class Pipeline:
             if self.from_stage in [None, "scout", "architect"]:
                 self._stage_executor(architect_output)
             elif self.from_stage == "executor":
-                # Executor doesn't have a simple output schema to re-run from
-                # We assume validator runs after execution.
-                pass
+                executor_result = self._load_stage_output(ExecutorOutput, "executor")
+                self._apply_executor_results(executor_result, model_used=executor_result.model)
 
             # ── Stage: Validator ────────────────────────────────────────────
             self._stage_validator()
@@ -129,6 +129,19 @@ class Pipeline:
             self.run.architect_meta = AgentMeta(status="failed", error=str(exc), latency_ms=_ms(t0))
             raise PipelineAbort(f"architect failed: {exc}")
 
+    def _apply_executor_results(self, result: ExecutorOutput, model_used: str = "unknown") -> None:
+        self.run.tasks_total = len(result.applied) + len(result.pending_review) + len(result.errors)
+        for change in result.applied:
+            self.run.task_results.append(TaskResult(task_id=change.task_id, status="applied", risk_level="low", model_used=model_used))
+            self.run.tasks_applied += 1
+        for change in result.pending_review:
+            self.run.task_results.append(TaskResult(task_id=change.task_id, status="diff_pending_review", risk_level="high", model_used=model_used))
+            self.run.pending_human_review.append(change.diff)
+            self.run.tasks_pending_review += 1
+        for change in result.errors:
+            self.run.task_results.append(TaskResult(task_id=change.task_id, status="failed", risk_level="low", model_used=model_used, error=change.error))
+            self.run.tasks_failed += 1
+
     def _stage_executor(self, architect_output: ArchitectOutput) -> None:
         _log("executor.start", run_id=self.run.run_id)
         t0 = time.monotonic()
@@ -136,18 +149,7 @@ class Pipeline:
             result, meta = run_executor(architect_output, config=self.config)
             self.run.executor_meta = AgentMeta(status="success", latency_ms=_ms(t0), **meta)
             self._persist_stage_output("executor", result)
-            self.run.tasks_total = len(architect_output.implementation_plan)
-            # Map executor results to run results
-            for change in result.applied:
-                self.run.task_results.append(TaskResult(task_id=change.task_id, status="applied", risk_level="low", model_used=meta.get("model_used", "unknown")))
-                self.run.tasks_applied += 1
-            for change in result.pending_review:
-                self.run.task_results.append(TaskResult(task_id=change.task_id, status="diff_pending_review", risk_level="high", model_used=meta.get("model_used", "unknown")))
-                self.run.pending_human_review.append(change.diff)
-                self.run.tasks_pending_review += 1
-            for change in result.errors:
-                self.run.task_results.append(TaskResult(task_id=change.task_id, status="failed", risk_level="low", model_used=meta.get("model_used", "unknown"), error=change.error))
-                self.run.tasks_failed += 1
+            self._apply_executor_results(result, model_used=meta.get("model_used", "unknown"))
         except Exception as exc:
             self.run.executor_meta = AgentMeta(status="failed", error=str(exc), latency_ms=_ms(t0))
             raise PipelineAbort(f"executor failed: {exc}")
