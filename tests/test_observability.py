@@ -2,7 +2,9 @@ import json
 import uuid
 from pathlib import Path
 
-from orchestrator.observability.events import log_event
+import pytest
+
+from orchestrator.observability.events import FailureType, log_event, log_failure
 from orchestrator.observability.logger import log_call
 
 # ---------------------------------------------------------------------------
@@ -163,3 +165,133 @@ class TestPipelineObservability:
         events = [e["event"] for e in lines]
         assert "pipeline_start" in events
         assert "pipeline_end" in events
+
+
+# ---------------------------------------------------------------------------
+# log_failure tests
+# ---------------------------------------------------------------------------
+
+class TestLogFailure:
+    def test_writes_failure_event_to_pipeline_jsonl(self, tmp_path: Path) -> None:
+        log_failure(
+            trace_id="t1",
+            run_id="r1",
+            stage="scout",
+            error_type=FailureType.LLM_ERROR,
+            message="Gemini failed",
+            logs_dir=tmp_path,
+        )
+        f = tmp_path / "pipeline.jsonl"
+        assert f.exists()
+        entry = json.loads(f.read_text())
+        assert entry["event"] == "failure"
+        assert entry["level"] == "error"
+
+    def test_schema_contains_error_type_message(self, tmp_path: Path) -> None:
+        log_failure(
+            trace_id="t2",
+            run_id="r2",
+            stage="architect",
+            error_type=FailureType.PIPELINE_ABORT,
+            message="architect raised blockers",
+            data={"blockers": ["missing deps"]},
+            logs_dir=tmp_path,
+        )
+        entry = json.loads((tmp_path / "pipeline.jsonl").read_text())
+        assert entry["trace_id"] == "t2"
+        assert entry["run_id"] == "r2"
+        assert entry["stage"] == "architect"
+        assert entry["level"] == "error"
+        assert entry["event"] == "failure"
+        assert entry["data"]["error_type"] == "pipeline_abort"
+        assert entry["data"]["message"] == "architect raised blockers"
+        assert entry["data"]["blockers"] == ["missing deps"]
+
+    def test_accepts_string_error_type(self, tmp_path: Path) -> None:
+        log_failure(
+            trace_id="t3",
+            run_id="r3",
+            stage="executor",
+            error_type="custom_error",
+            message="something went wrong",
+            logs_dir=tmp_path,
+        )
+        entry = json.loads((tmp_path / "pipeline.jsonl").read_text())
+        assert entry["data"]["error_type"] == "custom_error"
+
+    def test_writes_only_to_pipeline_jsonl_not_llm_calls(self, tmp_path: Path) -> None:
+        log_failure(
+            trace_id="t4",
+            run_id="r4",
+            stage="validator",
+            error_type=FailureType.TOOL_ERROR,
+            message="ruff failed",
+            logs_dir=tmp_path,
+        )
+        assert (tmp_path / "pipeline.jsonl").exists()
+        assert not (tmp_path / "llm_calls.jsonl").exists()
+
+
+class TestPipelineFailureIntegration:
+    def test_stage_failure_logs_structured_failure(self, tmp_path: Path, monkeypatch) -> None:
+        from orchestrator.pipeline import Pipeline
+        from orchestrator.schemas.config import TargetConfig
+
+        def mock_scout(config, **kw):
+            raise RuntimeError("LLM call timed out")
+
+        monkeypatch.setattr("orchestrator.pipeline.run_scout", mock_scout)
+
+        workspace = tmp_path / "workspace"
+        config = TargetConfig(target_path=tmp_path, workspace_path=workspace)
+        pipeline = Pipeline(config=config)
+        pipeline.execute()
+
+        f = workspace / "logs" / "pipeline.jsonl"
+        assert f.exists()
+        lines = [json.loads(line) for line in f.read_text().strip().splitlines()]
+        failure_events = [e for e in lines if e["event"] == "failure"]
+        assert len(failure_events) >= 1
+        fe = failure_events[-1]
+        assert fe["level"] == "error"
+        assert fe["data"]["error_type"] == "pipeline_abort"
+        assert "scout failed" in fe["data"]["message"]
+        assert fe["stage"] == "scout"
+
+    def test_architect_blockers_logs_structured_failure(self, tmp_path: Path, monkeypatch) -> None:
+        from orchestrator.pipeline import Pipeline
+        from orchestrator.schemas.architect_output import ArchitectOutput
+        from orchestrator.schemas.config import TargetConfig
+        from orchestrator.schemas.scout_output import ScoutOutput
+
+        def mock_scout(config, **kw):
+            return ScoutOutput(hotspots=[], summary="s", risks=["r"], recommended_order=[]), {"cost_usd": 0.0}
+
+        def mock_architect(*a, **kw):
+            output = ArchitectOutput(
+                validated_findings=[],
+                false_positives=[],
+                systemic_risks=[],
+                implementation_plan=[],
+                blockers=["Missing test command"],
+            )
+            return output, {"cost_usd": 0.0}
+
+        monkeypatch.setattr("orchestrator.pipeline.run_scout", mock_scout)
+        monkeypatch.setattr("orchestrator.pipeline.run_architect", mock_architect)
+
+        workspace = tmp_path / "workspace"
+        config = TargetConfig(target_path=tmp_path, workspace_path=workspace)
+        pipeline = Pipeline(config=config)
+        pipeline.execute()
+
+        f = workspace / "logs" / "pipeline.jsonl"
+        assert f.exists()
+        lines = [json.loads(line) for line in f.read_text().strip().splitlines()]
+        failure_events = [e for e in lines if e["event"] == "failure"]
+        assert len(failure_events) >= 1
+        fe = failure_events[-1]
+        assert fe["level"] == "error"
+        assert fe["data"]["error_type"] == "pipeline_abort"
+        assert "blockers" in fe["data"]
+        assert fe["data"]["blockers"] == ["Missing test command"]

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Union
 
 from orchestrator.clients.gemini_client import get_gemini_client
+from orchestrator.observability.events import FailureType, log_failure
 from orchestrator.observability.logger import log_call
 from orchestrator.schemas.config import TargetConfig
 from orchestrator.schemas.scout_output import ScoutOutput
@@ -129,6 +130,16 @@ def call_gemini(
                 latency_ms=latency_ms,
                 error=str(e),
             )
+            log_failure(
+                trace_id=trace_id or "",
+                run_id=run_id or "",
+                stage=stage,
+                error_type=FailureType.LLM_ERROR,
+                message=f"Gemini call {orchestratorel} failed: {e}",
+                source="agent",
+                duration_ms=latency_ms,
+                logs_dir=logs_dir,
+            )
             raise
 
     raise RuntimeError(f"[{orchestratorel}] Failed after retry.")
@@ -213,7 +224,22 @@ def run(
     )
     print(f"[Scout] Pass 1 done | tokens: {tokens1} | cost: ${cost1:.5f}")
 
-    selected: list[str] = json.loads(raw1)
+    try:
+        selected: list[str] = json.loads(raw1)
+    except json.JSONDecodeError as e:
+        print(f"[Scout] Pass 1 JSON parse error: {e}")
+        print(f"[Scout] Raw output:\n{raw1}")
+        log_failure(
+            trace_id=trace_id or "",
+            run_id=run_id or "",
+            stage="scout",
+            error_type=FailureType.SCHEMA_VALIDATION_ERROR,
+            message=f"Scout pass1 parsing failed: {e}",
+            source="agent",
+            data={"span_id": "scout_pass1"},
+            logs_dir=logs_dir,
+        )
+        raise
     print(f"[Scout] Selected {len(selected)} files: {selected}")
 
     # ── Pasada 2: contenido → diagnóstico JSON
@@ -234,15 +260,38 @@ def run(
     print(f"[Scout] Pass 2 done | tokens: {tokens2} | cost: ${cost2:.5f}")
     print(f"[Scout] Total cost: ${total_cost:.5f}")
 
-    # ── Validar schema
+    # ── Validar schema pass 2
     try:
         data = json.loads(raw2)
     except json.JSONDecodeError as e:
         print(f"[Scout] JSON parse error: {e}")
         print(f"[Scout] Raw output:\n{raw2}")
+        log_failure(
+            trace_id=trace_id or "",
+            run_id=run_id or "",
+            stage="scout",
+            error_type=FailureType.SCHEMA_VALIDATION_ERROR,
+            message=f"Scout pass2 parsing failed: {e}",
+            source="agent",
+            data={"span_id": "scout_pass2"},
+            logs_dir=logs_dir,
+        )
         raise
 
-    output = ScoutOutput(**data)
+    try:
+        output = ScoutOutput(**data)
+    except Exception as e:
+        print(f"[Scout] Schema validation error: {e}")
+        log_failure(
+            trace_id=trace_id or "",
+            run_id=run_id or "",
+            stage="scout",
+            error_type=FailureType.SCHEMA_VALIDATION_ERROR,
+            message=f"Scout schema validation failed: {e}",
+            source="agent",
+            logs_dir=logs_dir,
+        )
+        raise
     
     meta = {
         "tokens_input": tokens1["input"] + tokens2["input"],
