@@ -9,7 +9,7 @@ from orchestrator.agents.architect import run as run_architect
 from orchestrator.agents.executor import run as run_executor
 from orchestrator.agents.scout import run as run_scout
 from orchestrator.agents.validator import run as run_validator
-from orchestrator.observability.events import log_event
+from orchestrator.observability.events import FailureType, log_event, log_failure
 from orchestrator.schemas.architect_output import ArchitectOutput
 from orchestrator.schemas.config import TargetConfig
 from orchestrator.schemas.executor_output import ExecutorOutput
@@ -20,6 +20,17 @@ from orchestrator.workspace import WorkspaceManager
 
 class PipelineAbort(RuntimeError):
     """Raised when a stage fails and downstream stages must not execute."""
+    def __init__(
+        self,
+        message: str,
+        error_type: FailureType = FailureType.PIPELINE_ABORT,
+        stage: str | None = None,
+        data: dict | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+        self.stage = stage
+        self.data = data or {}
 
 class Pipeline:
     def __init__(self, config: TargetConfig, from_stage: str | None = None) -> None:
@@ -53,8 +64,38 @@ class Pipeline:
         # Keep stdout for current UX
         print(json.dumps({"event": event, "ts": datetime.utcnow().isoformat(), **({"data": data} if data else {})}))
 
+    def _log_failure(
+        self,
+        error_type: FailureType | str,
+        message: str,
+        *,
+        stage: str | None = None,
+        source: str = "pipeline",
+        retry_count: int | None = None,
+        duration_ms: int | None = None,
+        data: dict | None = None,
+    ) -> None:
+        log_failure(
+            trace_id=self.trace_id,
+            run_id=self.run.run_id,
+            stage=stage,
+            error_type=error_type,
+            message=message,
+            source=source,
+            retry_count=retry_count,
+            duration_ms=duration_ms,
+            data=data,
+            logs_dir=self.config.workspace_path / "logs",
+        )
+        error_type_value = error_type if isinstance(error_type, str) else error_type.value
+        payload = {"error_type": error_type_value, "message": message}
+        if data and "blockers" in data:
+            payload["blockers"] = data["blockers"]
+        print(json.dumps({"event": "failure", "ts": datetime.utcnow().isoformat(), "data": payload}))
+
     def execute(self, dry_run: bool = False) -> PipelineRun:
         self._log_event("pipeline_start", data={"target": str(self.target_path)})
+        t0_pipeline = time.monotonic()
 
         try:
             scout_output = None
@@ -93,10 +134,20 @@ class Pipeline:
 
         except PipelineAbort as exc:
             self.run.status = "failed"
-            self._log_event("failure", level="error", data={"reason": str(exc)})
+            self._log_failure(
+                error_type=exc.error_type,
+                message=str(exc),
+                stage=exc.stage,
+                duration_ms=_ms(t0_pipeline),
+                data=exc.data,
+            )
         except Exception as exc:
             self.run.status = "failed"
-            self._log_event("failure", level="error", data={"error": str(exc)})
+            self._log_failure(
+                error_type=FailureType.UNKNOWN,
+                message=str(exc),
+                duration_ms=_ms(t0_pipeline),
+            )
             raise
 
         else:
@@ -114,11 +165,19 @@ class Pipeline:
         outputs_dir = self.workspace.outputs
         files = sorted(outputs_dir.glob(f"{stage}_*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
         if not files:
-            raise PipelineAbort(f"No previous output found for stage {stage} in {outputs_dir}")
+            raise PipelineAbort(
+                f"No previous output found for stage {stage} in {outputs_dir}",
+                stage=stage,
+                data={"stage": stage},
+            )
         try:
             return model_class.model_validate_json(files[0].read_text())
         except Exception as e:
-            raise PipelineAbort(f"Failed to load {stage} output: {e}. Re-run from an earlier stage.")
+            raise PipelineAbort(
+                f"Failed to load {stage} output: {e}. Re-run from an earlier stage.",
+                stage=stage,
+                data={"stage": stage},
+            )
 
     def _persist_stage_output(self, stage: str, output) -> None:
         path = self.workspace.outputs / f"{stage}_{self.run.run_id}.json"
@@ -135,7 +194,7 @@ class Pipeline:
             return output
         except Exception as exc:
             self.run.scout_meta = AgentMeta(status="failed", error=str(exc), latency_ms=_ms(t0))
-            raise PipelineAbort(f"scout failed: {exc}")
+            raise PipelineAbort(f"scout failed: {exc}", stage="scout")
 
     def _stage_architect(self, scout_output: ScoutOutput) -> ArchitectOutput:
         self._log_event("stage_start", stage="architect")
@@ -147,13 +206,17 @@ class Pipeline:
             blockers = output.blockers
             self._log_event("stage_end", stage="architect", data={"cost_usd": meta.get("cost_usd"), "blockers": blockers})
             if blockers:
-                raise PipelineAbort(f"architect raised blockers: {blockers}")
+                raise PipelineAbort(
+                    f"architect raised blockers: {blockers}",
+                    stage="architect",
+                    data={"blockers": blockers},
+                )
             return output
         except PipelineAbort:
             raise
         except Exception as exc:
             self.run.architect_meta = AgentMeta(status="failed", error=str(exc), latency_ms=_ms(t0))
-            raise PipelineAbort(f"architect failed: {exc}")
+            raise PipelineAbort(f"architect failed: {exc}", stage="architect")
 
     def _apply_executor_results(self, result: ExecutorOutput, model_used: str = "unknown") -> None:
         self.run.tasks_total = len(result.applied) + len(result.pending_review) + len(result.errors)
@@ -179,7 +242,7 @@ class Pipeline:
             self._log_event("stage_end", stage="executor", data={"cost_usd": meta.get("cost_usd"), "tasks_applied": self.run.tasks_applied})
         except Exception as exc:
             self.run.executor_meta = AgentMeta(status="failed", error=str(exc), latency_ms=_ms(t0))
-            raise PipelineAbort(f"executor failed: {exc}")
+            raise PipelineAbort(f"executor failed: {exc}", stage="executor")
 
     def _stage_validator(self) -> None:
         if self.run.tasks_applied == 0:
@@ -194,7 +257,7 @@ class Pipeline:
             self._persist_stage_output("validator", result)
         except Exception as exc:
             self.run.validator_meta = AgentMeta(status="failed", error=str(exc), latency_ms=_ms(t0))
-            self._log_event("failure", level="error", stage="validator", data={"error": str(exc)})
+            self._log_failure(FailureType.TOOL_ERROR, f"validator failed: {exc}", stage="validator", duration_ms=_ms(t0))
 
     def _final_status(self) -> str:
         if self.run.validator_meta and self.run.validator_meta.status == "failed":

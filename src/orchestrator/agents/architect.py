@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional, Union
 
 from orchestrator.clients.anthropic_client import get_anthropic_client
+from orchestrator.observability.events import FailureType, log_failure
 from orchestrator.observability.logger import log_call
 from orchestrator.schemas.architect_output import ArchitectOutput
 from orchestrator.schemas.config import TargetConfig
@@ -98,6 +99,16 @@ def call_claude(
                 latency_ms=latency_ms,
                 error=str(e),
             )
+            log_failure(
+                trace_id=trace_id or "",
+                run_id=run_id or "",
+                stage=stage,
+                error_type=FailureType.LLM_ERROR,
+                message=f"Claude call {orchestratorel} failed: {e}",
+                source="agent",
+                duration_ms=latency_ms,
+                logs_dir=logs_dir,
+            )
             raise RuntimeError(f"[{orchestratorel}] Failed: {e}")
 
     raise RuntimeError(f"[{orchestratorel}] Failed after retry.")
@@ -171,9 +182,31 @@ def run(
     except json.JSONDecodeError as e:
         print(f"[Architect] JSON parse error: {e}")
         print(f"[Architect] Raw output:\n{raw_response}")
+        log_failure(
+            trace_id=trace_id or "",
+            run_id=run_id or "",
+            stage="architect",
+            error_type=FailureType.SCHEMA_VALIDATION_ERROR,
+            message=f"Architect JSON parsing failed: {e}",
+            source="agent",
+            logs_dir=logs_dir,
+        )
         raise
 
-    output = ArchitectOutput(**data)
+    try:
+        output = ArchitectOutput(**data)
+    except Exception as e:
+        print(f"[Architect] Schema validation error: {e}")
+        log_failure(
+            trace_id=trace_id or "",
+            run_id=run_id or "",
+            stage="architect",
+            error_type=FailureType.SCHEMA_VALIDATION_ERROR,
+            message=f"Architect schema validation failed: {e}",
+            source="agent",
+            logs_dir=logs_dir,
+        )
+        raise
 
     meta = {
         "tokens_input": tokens["input"],

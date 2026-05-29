@@ -1,7 +1,17 @@
 import json
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
+
+
+class FailureType(StrEnum):
+    LLM_ERROR = "llm_error"
+    SCHEMA_VALIDATION_ERROR = "schema_validation_error"
+    TIMEOUT_ERROR = "timeout_error"
+    TOOL_ERROR = "tool_error"
+    PIPELINE_ABORT = "pipeline_abort"
+    UNKNOWN = "unknown"
 
 
 def log_event(
@@ -35,3 +45,44 @@ def log_event(
     path = logs_dir / "pipeline.jsonl"
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, default=str) + "\n")
+
+
+def log_failure(
+    trace_id: str,
+    run_id: str,
+    stage: str | None,
+    error_type: FailureType | str,
+    message: str,
+    *,
+    source: str = "pipeline",
+    retry_count: int | None = None,
+    duration_ms: int | None = None,
+    data: dict[str, Any] | None = None,
+    logs_dir: Path | None = None,
+) -> None:
+    """Write a normalized failure event to pipeline.jsonl."""
+    if data is None:
+        data = {}
+
+    error_type_str = error_type if isinstance(error_type, str) else error_type.value
+
+    failure_data = {
+        "error_type": error_type_str,
+        "message": message,
+        "retry_count": retry_count,
+        "duration_ms": duration_ms,
+    }
+
+    # Ensure authority of normalized fields
+    merged_data = {**data, **failure_data}
+
+    log_event(
+        trace_id=trace_id,
+        run_id=run_id,
+        level="error",
+        source=source,
+        stage=stage,
+        event="failure",
+        data=merged_data,
+        logs_dir=logs_dir,
+    )
